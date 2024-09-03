@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use std::collections::HashMap;
 
 declare_id!("56pCh7Zmmnb8UFoincPhC2U7ABKwpKBTLPQAWYFbUpSV");
 
@@ -8,28 +9,32 @@ pub mod asset_vault {
     use super::*;
 
     pub fn setup_vault(ctx: Context<SetupVault>) -> Result<()> {
+        let vault = &mut ctx.accounts.vault_account;
+        vault.depositor_balances = HashMap::new(); // Initialize the HashMap
         msg!("Vault setup completed.");
         Ok(())
     }
 
     pub fn add_funds(ctx: Context<FundVault>, deposit_amount: u64) -> Result<()> {
         msg!("Depositing {} tokens", deposit_amount);
+        let depositor = ctx.accounts.depositor.to_account_info().key();
+        let mut vault = &mut ctx.accounts.vault_account;
 
-        let depositor_account = &ctx.accounts.depositor_account;
-        if depositor_account.amount < deposit_amount {
+        // Check if the depositor has enough tokens
+        if ctx.accounts.depositor_account.amount < deposit_amount {
             return Err(VaultError::InsufficientFunds.into());
         }
 
-        let transfer_cpi = Transfer {
-            from: ctx.accounts.depositor_account.to_account_info(),
-            to: ctx.accounts.vault_account.to_account_info(),
-            authority: ctx.accounts.user.to_account_info(),
-        };
+        // Update depositor balance
+        let balances = &mut vault.depositor_balances;
+        let balance = balances.entry(*depositor).or_insert(0);
+        *balance += deposit_amount;
 
+        // Transfer tokens into the vault
         let cpi_accounts = Transfer {
             from: ctx.accounts.depositor_account.to_account_info(),
             to: ctx.accounts.vault_account.to_account_info(),
-            authority: ctx.accounts.user.to_account_info(),
+            authority: ctx.accounts.depositor.to_account_info(),
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
@@ -40,19 +45,22 @@ pub mod asset_vault {
     }
 
     pub fn withdraw_funds(ctx: Context<WithdrawFunds>, withdraw_amount: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault_account;
-        let withdrawer = &ctx.accounts.withdrawer;
+        msg!("Attempting to withdraw {} tokens", withdraw_amount);
+        let withdrawer = ctx.accounts.withdrawer.to_account_info().key();
+        let mut vault = &mut ctx.accounts.vault_account;
 
-        if *vault.owner != *withdrawer.key {
-            return Err(VaultError::UnauthorizedWithdrawal.into());
+        // Check if the withdrawer has sufficient balance
+        let balances = &mut vault.depositor_balances;
+        let balance = balances
+            .get_mut(&withdrawer)
+            .ok_or(VaultError::UnauthorizedWithdrawal)?;
+        if *balance < withdraw_amount {
+            return Err(VaultError::InsufficientFunds.into());
         }
 
-        let transfer_cpi = Transfer {
-            from: ctx.accounts.vault_account.to_account_info(),
-            to: ctx.accounts.withdrawer_account.to_account_info(),
-            authority: ctx.accounts.withdrawer.to_account_info(),
-        };
+        *balance -= withdraw_amount; // Update the balance
 
+        // Transfer tokens from the vault to the withdrawer
         let cpi_accounts = Transfer {
             from: ctx.accounts.vault_account.to_account_info(),
             to: ctx.accounts.withdrawer_account.to_account_info(),
@@ -83,7 +91,7 @@ pub struct FundVault<'info> {
     #[account(mut)]
     pub depositor_account: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub user: Signer<'info>,
+    pub depositor: Signer<'info>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -101,6 +109,7 @@ pub struct WithdrawFunds<'info> {
 #[account]
 pub struct Vault {
     pub owner: Pubkey,
+    pub depositor_balances: HashMap<Pubkey, u64>,
 }
 
 #[error_code]
